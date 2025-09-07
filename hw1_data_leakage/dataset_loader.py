@@ -31,6 +31,39 @@ class Dataset:
         if not self.records:
             raise ValueError(f"No samples found under {self.root_dir}. ")
 
+    def _hamilton_method(self, total: int, ratios: List[float]) -> List[int]:
+        # https://math.libretexts.org/Bookshelves/Applied_Mathematics/Math_in_Society_(Lippman)/04%3A_Apportionment/4.02%3A_Hamiltons_Method
+        raw = [total*r for r in ratios]
+        quota = [int(r) for r in raw]
+        remaining = total - sum(quota)
+
+        order = sorted(
+            [(i, raw[i] - quota[i]) for i in range(len(ratios))],
+            key=lambda x: (-x[1], x[0])
+        )
+
+        for _, idx in order[:remaining]:
+            quota[idx] += 1
+        return quota
+    
+    def _split_by_label(self, label_counts: Dict[int, int], ratio: float, target_count:int) -> Dict[int, int]:
+        floors = {label: int(count * ratio) for label, count in label_counts.items()}
+        base = sum(floors.values())
+        need = target_count - base
+
+        if need == 0:
+            # perfect match
+            return floors
+    
+        ranked = sorted(
+            [(label, count * ratio - floors[label]) for label, count in label_counts.items()],
+            key=lambda x: (-x[1], x[0])
+        )
+        for i in range(need):
+            label, _ = ranked[i]
+            floors[label] += 1
+        return floors
+
     def train_validation_test_split(
         self,
         train_ratio: float,
@@ -40,74 +73,67 @@ class Dataset:
         out_path: Optional[Path] = None
     ) -> Tuple[List[Sample], List[Sample], List[Sample]]:
         
-        # check ratios
+        # Check ratios
         if not (0 < train_ratio < 1 and 0 < val_ratio < 1 and 0 < test_ratio < 1):
             raise ValueError("Ratios must be between 0 and 1.")
         
         if abs((train_ratio + val_ratio + test_ratio) - 1.0) > 1e-6:
             raise ValueError("Sum of ratios must equal 1")
         
-        # random shuffle with seed
+        # set seed
         if random_seed is not None:
             rng = random.Random(random_seed)
         else:
             rng = random.Random()  
         
-        train_split: List[Sample] = []
-        val_split: List[Sample] = []
-        test_split: List[Sample] = []
-
+        # Group samples by label
         sample_by_label: Dict[int, List[Sample]] = defaultdict(list)
         for record in self.records:
             sample_by_label[record.label].append(record)
 
-        for label, items in sample_by_label.items():
-                items = items[:]  # make a copy
-                rng.shuffle(items)
+        # Assign group quotas with Hamilton's method
+        N = len(self.records)
+        T_train, T_val, T_test = self._hamilton_method(N, [train_ratio, val_ratio, test_ratio])
 
-                n = len(items)
+        label_counts: Dict[int, int] = {label: len(items) for label, items in sample_by_label.items()}
 
-                raw = [n * train_ratio, n * val_ratio, n * test_ratio]
-                floors = [int(x) for x in raw]
-                remaining = n - sum(floors)
-            
-                remainders = sorted(((raw[i] - floors[i], i) for i in range(3)), key=lambda t: (-t[0], t[1]))
-                for _, idx in remainders[:remaining]:
-                    floors[idx] += 1
-                n_train, n_val, n_test = floors
+        n_train_c = self._split_by_label(label_counts, train_ratio, T_train)
+        n_val_c   = self._split_by_label(label_counts, val_ratio, T_val)
+        n_test_c  = {c: label_counts[c] - n_train_c[c] - n_val_c[c] for c in label_counts} # take the remainder
 
-                train_split.extend(items[:n_train])
-                val_split.extend(items[n_train:n_train + n_val])
-                test_split.extend(items[n_train + n_val: n_train + n_val + n_test])
+        train_split: List[Sample] = []
+        val_split:   List[Sample] = []
+        test_split:  List[Sample] = []
 
-        val_surplus = len(val_split) - 9000
-        if val_surplus > 0:
-            # move surplus from val to test
-            moved = val_split[:val_surplus]
-            test_split.extend(moved)
-            val_split = val_split[val_surplus:]
-        elif val_surplus < 0:
-            # move deficit from test to val
-            deficit = -val_surplus
-            moved = test_split[:deficit]
-            val_split.extend(moved)
-            test_split = test_split[deficit:]
+        for label in sorted(sample_by_label.keys()): # sort by label for reproducibility
+            items = sample_by_label[label][:]
+            rng.shuffle(items)
 
+            cnt_train = n_train_c[label]
+            cnt_val   = n_val_c[label]
+            cnt_test  = n_test_c[label]
 
+            train_split.extend(items[:cnt_train])
+            val_split.extend(items[cnt_train:cnt_train + cnt_val])
+            test_split.extend(items[cnt_train + cnt_val:cnt_train + cnt_val + cnt_test])
+        
+        # (Optional) Save to files
         if out_path is not None:
             out_path.mkdir(parents=True, exist_ok=True)
-            train_file = out_path / "train_list.txt"
-            val_file   = out_path / "val_list.txt"
-            test_file  = out_path / "test_list.txt"
+            for split, name in [(train_split, "train_list.txt"),
+                                (val_split,   "val_list.txt"),
+                                (test_split,  "test_list.txt")]:
+                with open(out_path / name, "w") as f:
+                    for s in split:
+                        f.write(f"{s.rel_path} {s.label}\n")
 
-            for split, file in zip([train_split, val_split, test_split], [train_file, val_file, test_file]):
-                with open(file, 'w') as f:
-                    for sample in split:
-                        f.write(f"{sample.rel_path} {sample.label}\n")
-        
-        print(f"Train set size: {len(train_split)}\nValidation set size: {len(val_split)}\nTest set size: {len(test_split)}")
-
+        print(
+            f"Train set size: {len(train_split)}\n"
+            f"Validation set size: {len(val_split)}\n"
+            f"Test set size: {len(test_split)}"
+        )
         return train_split, val_split, test_split
+
 
     def load_split_from_file(self, file_path: Path) -> List[Sample]:
         samples = []
