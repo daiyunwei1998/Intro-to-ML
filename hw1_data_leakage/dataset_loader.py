@@ -42,7 +42,7 @@ class Dataset:
             key=lambda x: (-x[1], x[0])
         )
 
-        for _, idx in order[:remaining]:
+        for idx, _ in order[:remaining]:
             quota[idx] += 1
         return quota
     
@@ -59,9 +59,22 @@ class Dataset:
             [(label, count * ratio - floors[label]) for label, count in label_counts.items()],
             key=lambda x: (-x[1], x[0])
         )
-        for i in range(need):
-            label, _ = ranked[i]
-            floors[label] += 1
+
+        if need > 0:
+            n = len(ranked)
+            for k in range(need):
+                c, _ = ranked[k % n]
+                floors[c] += 1
+        else:
+            # if we've assigned more than global target
+
+            to_remove = -need
+            while to_remove > 0:
+                for c, _ in reversed(ranked): 
+                    if floors[c] > 0:
+                        floors[c] -= 1
+                        to_remove -= 1
+
         return floors
 
     def train_validation_test_split(
